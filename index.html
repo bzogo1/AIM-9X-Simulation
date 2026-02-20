@@ -268,7 +268,7 @@ canvas{display:block}
   <div class="warn-strip" id="overspeed-warn">⚠ OVERSPEED ⚠</div>
 
   <div id="ctrls">
-    W/S — THROTTLE &nbsp;|&nbsp; A/D — RUDDER/YAW &nbsp;|&nbsp; ↑ NOSE DOWN · ↓ NOSE UP &nbsp;|&nbsp; ←/→ ROLL
+    W/S — THROTTLE &nbsp;|&nbsp; A/D — YAW &nbsp;|&nbsp; ↑ NOSE DOWN · ↓ NOSE UP &nbsp;|&nbsp; ← BANK LEFT · → BANK RIGHT
   </div>
 </div>
 
@@ -816,134 +816,136 @@ class F22 {
     this.throttle+=(this.targetThrottle-this.throttle)*dt*2.2;
     this.thrust=this._calcThrust(this.throttle);
 
-    // ── Control surface deflections ────────────────────────────
-    // Smaller max deflections + slow actuator rate = gentle, flyable response
-    const maxDE = 14*DEG; // was 30° — elevator max
-    const maxDA = 10*DEG; // was 25° — aileron max
-    const maxDR =  8*DEG; // was 22° — rudder max
-    // Actuator bandwidth: real F-22 ~60°/s, but we slow it further for keyboard feel
-    const ctrlRate = 1.8; // was 3.0 — surfaces reach target in ~0.6 s
+    // ── Control inputs → direct angular rates ─────────────────
+    // ↑ arrow = nose DOWN (push stick forward), ↓ = nose UP (pull back)
+    // ← arrow = bank/roll LEFT (left wing dips, plane turns left)
+    // → arrow = bank/roll RIGHT
+    // A/D    = yaw left/right (rudder)
 
-    const elevTarget = ((inp.down?1:0)+(inp.up?-1:0))*maxDE;
-    const aileTarget = ((inp.right?-1:0)+(inp.left?1:0))*maxDA;
-    const ruddTarget = ((inp.a?1:0)+(inp.d?-1:0))*maxDR;
+    const pitchInput = (inp.up ? 1 : 0)    + (inp.down ? -1 : 0);  // +1 = nose down
+    const rollInput  = (inp.right ? 1 : 0) + (inp.left ? -1 : 0);  // +1 = roll right
+    const yawInput   = (inp.d ? 1 : 0)     + (inp.a ? -1 : 0);     // +1 = yaw right
 
-    this.ctrl.elevator+=(elevTarget-this.ctrl.elevator)*dt*ctrlRate;
-    this.ctrl.aileron +=(aileTarget-this.ctrl.aileron )*dt*ctrlRate;
-    this.ctrl.rudder  +=(ruddTarget-this.ctrl.rudder  )*dt*ctrlRate;
-
-    // ── ISA atmosphere at current altitude ─────────────────────
+    // Speed-scaled control effectiveness — slower speed = less authority
     const atm = isa(this.pos.y);
     this.rho  = atm.rho;
-    const Vt  = this.vel.length(); // true airspeed
+    const Vt  = Math.max(this.vel.length(), 30);
     this.speed = Vt;
+    const qBar  = 0.5 * this.rho * Vt * Vt;   // dynamic pressure
+    const qNorm = THREE.MathUtils.clamp(qBar / 12000, 0.05, 1.0); // normalised 0–1
 
-    // ── Body-frame velocity (for AoA & sideslip) ──────────────
-    // Transform world-velocity into body frame
-    const quatInv = this.quat.clone().conjugate();
+    // Maximum angular rates (rad/s) — tuned for flyable keyboard feel
+    const maxPitch = 0.55 * qNorm;   // ~31°/s at cruise
+    const maxRoll  = 0.70 * qNorm;   // ~40°/s at cruise
+    const maxYaw   = 0.25 * qNorm;   // ~14°/s
+
+    // Smooth target angular rates with slew limiting
+    const pitchTgt = pitchInput * maxPitch;
+    const rollTgt  = rollInput  * maxRoll;
+    const yawTgt   = yawInput   * maxYaw;
+
+    const slew = 4.0 * dt;
+    this._pr = this._pr || 0; this._rr = this._rr || 0; this._yr = this._yr || 0;
+    this._pr += THREE.MathUtils.clamp(pitchTgt - this._pr, -slew, slew);
+    this._rr += THREE.MathUtils.clamp(rollTgt  - this._rr, -slew, slew);
+    this._yr += THREE.MathUtils.clamp(yawTgt   - this._yr, -slew, slew);
+
+    // Auto-centre when no input (stability augmentation)
+    if (!inp.up && !inp.down)    this._pr *= Math.pow(0.05, dt);
+    if (!inp.left && !inp.right) this._rr *= Math.pow(0.08, dt);
+    if (!inp.a && !inp.d)        this._yr *= Math.pow(0.12, dt);
+
+    // ── Apply rotations in LOCAL body frame ──────────────────
+    // Pitch: rotate around local X axis (wing axis, right-hand = nose up)
+    //        pitchInput +1 = nose DOWN → negative rotation around local X
+    const localX = new THREE.Vector3(1, 0, 0).applyQuaternion(this.quat);
+    const qPitch = new THREE.Quaternion().setFromAxisAngle(localX, -this._pr * dt);
+
+    // Roll: rotate around local Z axis (longitudinal axis)
+    //       rollInput +1 = right bank → negative rotation around local +Z
+    const localZ = new THREE.Vector3(0, 0, 1).applyQuaternion(this.quat);
+    const qRoll  = new THREE.Quaternion().setFromAxisAngle(localZ, -this._rr * dt);
+
+    // Yaw: rotate around world Y (keeps yaw independent of bank)
+    const qYaw   = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), this._yr * dt);
+
+    this.quat.premultiply(qYaw).multiply(qPitch).multiply(qRoll).normalize();
+
+    // ── AoA / sideslip for HUD display ───────────────────────
+    const quatInv  = this.quat.clone().conjugate();
     const vel_body = this.vel.clone().applyQuaternion(quatInv);
-    // Body +X = nose (-Z world initially), +Y = up, +Z = right
-    // In our convention: nose = local -Z, so body forward = local -Z
-    // Remap: u = -vel_body.z (forward), v = vel_body.x (right), w = -vel_body.y (up)
-    const u =  -vel_body.z;  // forward component
-    const v =   vel_body.x;  // right (positive = right sideslip)
-    const w =  -vel_body.y;  // up component (positive = flying nose-up)
-
-    // AoA: positive when nose is above velocity vector (pulling up)
-    this.alpha = Math.atan2(w, Math.max(u, 1));
-    this.beta  = Math.asin(THREE.MathUtils.clamp(v / Math.max(Vt,1), -1, 1));
-
-    // ── Aerodynamic forces ────────────────────────────────────
-    const { CL, CD, Lift, Drag, Side, Mroll, Mpitch, Myaw } =
-      computeAero(this.alpha, this.beta, this.omega, this.ctrl, this.rho, Vt);
-
+    const uf =  -vel_body.z;
+    const vf =   vel_body.x;
+    const wf =  -vel_body.y;
+    this.alpha = Math.atan2(wf, Math.max(uf, 1));
+    this.beta  = Math.asin(THREE.MathUtils.clamp(vf / Math.max(Vt,1), -1, 1));
     this.isStall = Math.abs(this.alpha) > AC.alpha_stall;
 
-    // ── Build force vector in BODY frame, then rotate to world ─
-    // Lift acts perpendicular to velocity in the pitch plane (body +Y direction approx)
-    // Drag acts opposite to velocity
-    // Thrust acts along body -Z (nose direction)
+    // ── Aerodynamic lift / drag / sideforce ──────────────────
+    const alpha_eff = THREE.MathUtils.clamp(this.alpha, -AC.alpha_stall * 1.2, AC.alpha_stall * 1.2);
+    let CL = AC.CL0 + AC.CLalpha * alpha_eff;
+    if (Math.abs(this.alpha) > AC.alpha_stall) {
+      const excess = Math.abs(this.alpha) - AC.alpha_stall;
+      CL = Math.sign(this.alpha) * Math.max(0, AC.CLmax - 1.2 * excess);
+    }
+    CL = THREE.MathUtils.clamp(CL, -AC.CLmax, AC.CLmax);
+    const CDi   = CL * CL / (Math.PI * AC.AR * AC.eOswald);
+    const CD    = AC.CD0 + CDi;
+    const Lift  = CL * qBar * AC.S_ref;
+    const Drag  = CD * qBar * AC.S_ref;
+    const Side  = -0.5 * this.beta * qBar * AC.S_ref;
+
+    // ── Force vectors in world space ─────────────────────────
     const noseWorld = new THREE.Vector3(0,0,-1).applyQuaternion(this.quat);
     const upBody    = new THREE.Vector3(0,1,0).applyQuaternion(this.quat);
-    const velNorm   = Vt>1 ? this.vel.clone().normalize() : noseWorld.clone();
+    const velNorm   = Vt > 1 ? this.vel.clone().normalize() : noseWorld.clone();
 
-    // Lift direction: perpendicular to velocity, in the plane of velocity and body up
-    const liftDir = new THREE.Vector3().crossVectors(velNorm, new THREE.Vector3().crossVectors(upBody, velNorm).normalize()).normalize();
-    if(liftDir.lengthSq()<0.001) liftDir.copy(upBody);
+    // Lift perpendicular to velocity, in the plane containing body-up
+    const liftDir = new THREE.Vector3()
+      .crossVectors(velNorm, new THREE.Vector3().crossVectors(upBody, velNorm).normalize())
+      .normalize();
+    if (liftDir.lengthSq() < 0.001) liftDir.copy(upBody);
 
     const rightBody = new THREE.Vector3(1,0,0).applyQuaternion(this.quat);
 
     const F = new THREE.Vector3();
-    // Thrust
-    F.addScaledVector(noseWorld, this.thrust);
-    // Lift
-    F.addScaledVector(liftDir, Lift);
-    // Drag
-    F.addScaledVector(velNorm, -Drag);
-    // Sideforce
-    F.addScaledVector(rightBody, Side);
-    // Gravity (world -Y)
-    F.y -= AC.mass * GRAVITY;
+    F.addScaledVector(noseWorld, this.thrust);   // thrust along nose
+    F.addScaledVector(liftDir,   Lift);           // lift ⊥ velocity
+    F.addScaledVector(velNorm,  -Drag);           // drag opposing motion
+    F.addScaledVector(rightBody, Side);           // sideforce
+    F.y -= AC.mass * GRAVITY;                     // gravity
 
-    // ── Linear acceleration → velocity → position ─────────────
+    // ── Integrate linear motion ───────────────────────────────
     const accel = F.clone().divideScalar(AC.mass);
     this.vel.addScaledVector(accel, dt);
+
+    // Velocity tracking: gently steer velocity toward nose direction
+    // This is the key trick that makes the plane "go where it's pointing"
+    // while still having the momentum of real aerodynamics
+    const noseVelBlend = THREE.MathUtils.clamp(qNorm * 0.9 * dt, 0, 0.05);
+    const desiredVel   = noseWorld.clone().multiplyScalar(Vt);
+    this.vel.lerp(desiredVel, noseVelBlend);
+
     this.pos.addScaledVector(this.vel, dt);
 
-    // ── Moments → angular acceleration → angular velocity ──────
-    // Body-frame Euler's equations: I*alpha = M - omega × (I*omega)
-    const p=this.omega.x, q=this.omega.y, r=this.omega.z;
-    const Ixx=AC.Ixx,Iyy=AC.Iyy,Izz=AC.Izz,Ixz=AC.Ixz;
-    // Simplified (Ixz small): standard rigid body equations
-    const pdot = (Mroll  + (Iyy-Izz)*q*r + Ixz*(p*q)) / Ixx;
-    const qdot = (Mpitch + (Izz-Ixx)*p*r - Ixz*(p*p-r*r)) / Iyy;
-    const rdot = (Myaw   + (Ixx-Iyy)*p*q + Ixz*(q*r)) / Izz;
+    // Store angular rates for G-force calc (use pitch rate as proxy)
+    this.gForce = 1.0 + Math.abs(this._pr) * Vt / GRAVITY;
+    this.gForce = THREE.MathUtils.clamp(this.gForce, 0.1, 9.5);
 
-    // Limit angular rates for stability and flyability
-    // Real F-22 can do ~60°/s pitch, ~100°/s roll — we cap lower for keyboard control
-    const omegaMax = 1.8; // rad/s ≈ 103°/s — was 6.0 (way too fast)
-    this.omega.x = THREE.MathUtils.clamp(this.omega.x + pdot*dt, -omegaMax, omegaMax);
-    this.omega.y = THREE.MathUtils.clamp(this.omega.y + qdot*dt, -omegaMax*0.6, omegaMax*0.6);
-    this.omega.z = THREE.MathUtils.clamp(this.omega.z + rdot*dt, -omegaMax*0.7, omegaMax*0.7);
-
-    // Auto-damping: when no roll/pitch input active, bleed off residual rotation
-    // This prevents the aircraft from perpetually spinning from a tap of a key
-    const hasRoll  = inp.left  || inp.right;
-    const hasPitch = inp.up    || inp.down;
-    const hasYaw   = inp.a     || inp.d;
-    if (!hasRoll)  this.omega.x *= Math.pow(0.04, dt); // fast roll decay
-    if (!hasPitch) this.omega.y *= Math.pow(0.06, dt); // fast pitch decay
-    if (!hasYaw)   this.omega.z *= Math.pow(0.10, dt); // fast yaw decay
-
-    // Integrate quaternion: q_dot = 0.5 * q ⊗ [0, omega]
-    const omegaQ = new THREE.Quaternion(this.omega.x*0.5*dt, this.omega.y*0.5*dt, this.omega.z*0.5*dt, 0);
-    const dq = omegaQ.clone();
-    dq.premultiply(this.quat); // q ⊗ omegaQ
-    this.quat.x += dq.x;
-    this.quat.y += dq.y;
-    this.quat.z += dq.z;
-    this.quat.w += dq.w;
-    this.quat.normalize();
-
-    // ── Terrain collision ─────────────────────────────────────
+    // ── Terrain & ceiling ────────────────────────────────────
     const terrH = getTerrainH(this.pos.x, this.pos.z);
-    if(this.pos.y < terrH + 20) {
-      this.pos.y = terrH + 20;
+    if (this.pos.y < terrH + 25) {
+      this.pos.y = terrH + 25;
       this.vel.y = Math.max(0, this.vel.y);
-      // Auto pull-up if near terrain
-      const pu=new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), dt*1.5);
-      this.quat.premultiply(pu).normalize();
+      // Auto pull-up nudge when near terrain
+      const pu = new THREE.Quaternion().setFromAxisAngle(localX, dt * 1.2);
+      this.quat.multiply(pu).normalize();
     }
-    this.pos.y=Math.min(this.pos.y, 19500);
+    this.pos.y = Math.min(this.pos.y, 19500);
 
-    // ── Sync mesh ─────────────────────────────────────────────
+    // ── Sync mesh ────────────────────────────────────────────
     this.root.position.copy(this.pos);
     this.root.quaternion.copy(this.quat);
-
-    // ── G-force (normal load factor) ──────────────────────────
-    // Nz = Lift / Weight (simplified: Nz = accel_y_body / g)
-    this.gForce = Lift / (AC.mass * GRAVITY);
-    this.gForce = THREE.MathUtils.clamp(this.gForce, -3, 9);
 
     // ── IR heat signature ──────────────────────────────────────
     const heatTgt = this.throttle > 0.75
